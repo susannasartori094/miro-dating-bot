@@ -1,5 +1,7 @@
 import os
 import logging
+import psycopg2
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -16,9 +18,13 @@ from telegram.ext import (
 # =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN n'est pas configuré.")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL n'est pas configuré.")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -26,17 +32,160 @@ logging.basicConfig(
 )
 
 # =========================
+# BASE DE DONNÉES
+# =========================
+
+def get_connection():
+    return psycopg2.connect(DATABASE_URL)
+
+
+def init_database():
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id BIGINT PRIMARY KEY,
+            prenom TEXT NOT NULL,
+            age INTEGER NOT NULL,
+            sexe TEXT NOT NULL,
+            ville TEXT NOT NULL,
+            description TEXT NOT NULL,
+            photo_id TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS likes (
+            user_id BIGINT NOT NULL,
+            liked_user_id BIGINT NOT NULL,
+            PRIMARY KEY (user_id, liked_user_id)
+        )
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def save_profile(user_id, prenom, age, sexe, ville, description, photo_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO profiles
+        (user_id, prenom, age, sexe, ville, description, photo_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            prenom = EXCLUDED.prenom,
+            age = EXCLUDED.age,
+            sexe = EXCLUDED.sexe,
+            ville = EXCLUDED.ville,
+            description = EXCLUDED.description,
+            photo_id = EXCLUDED.photo_id
+    """, (
+        user_id,
+        prenom,
+        age,
+        sexe,
+        ville,
+        description,
+        photo_id,
+    ))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_profile(user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id, prenom, age, sexe, ville, description, photo_id
+        FROM profiles
+        WHERE user_id = %s
+    """, (user_id,))
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return row
+
+
+def get_other_profiles(user_id, seen_ids):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    if seen_ids:
+        cur.execute("""
+            SELECT user_id, prenom, age, sexe, ville, description, photo_id
+            FROM profiles
+            WHERE user_id != %s
+            AND NOT (user_id = ANY(%s))
+            ORDER BY user_id
+            LIMIT 1
+        """, (user_id, list(seen_ids)))
+    else:
+        cur.execute("""
+            SELECT user_id, prenom, age, sexe, ville, description, photo_id
+            FROM profiles
+            WHERE user_id != %s
+            ORDER BY user_id
+            LIMIT 1
+        """, (user_id,))
+
+    row = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return row
+
+
+def add_like(user_id, liked_user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO likes (user_id, liked_user_id)
+        VALUES (%s, %s)
+        ON CONFLICT DO NOTHING
+    """, (user_id, liked_user_id))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def is_match(user_id, other_user_id):
+    conn = get_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT 1
+        FROM likes
+        WHERE user_id = %s
+        AND liked_user_id = %s
+    """, (other_user_id, user_id))
+
+    result = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return result is not None
+
+
+# =========================
 # ÉTAPES DU PROFIL
 # =========================
 
 PRENOM, AGE, SEXE, VILLE, DESCRIPTION, PHOTO = range(6)
-
-# Profils en mémoire
-profiles = {}
-
-# Likes :
-# likes[user_id] = {user_id_1, user_id_2, ...}
-likes = {}
 
 
 # =========================
@@ -47,10 +196,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "❤️ Bienvenue sur MIRO DATING !\n\n"
         "Trouve des personnes, découvre des profils et fais de nouvelles rencontres.\n\n"
-        "Commandes disponibles :\n"
-        "👤 /profil — créer ou modifier ton profil\n"
-        "🔎 /decouvrir — découvrir des profils\n"
-        "❌ /annuler — annuler une création de profil"
+        "👤 /profil — créer ton profil\n"
+        "🔎 /decouvrir — découvrir des profils"
     )
 
 
@@ -73,8 +220,7 @@ async def recevoir_prenom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prenom"] = update.message.text.strip()
 
     await update.message.reply_text(
-        "🎂 Quel âge as-tu ?\n\n"
-        "Entre uniquement ton âge en chiffres."
+        "🎂 Quel âge as-tu ?"
     )
 
     return AGE
@@ -85,8 +231,7 @@ async def recevoir_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not texte.isdigit():
         await update.message.reply_text(
-            "⚠️ Entre ton âge uniquement en chiffres.\n\n"
-            "Exemple : 26"
+            "⚠️ Entre ton âge uniquement en chiffres."
         )
         return AGE
 
@@ -130,10 +275,7 @@ async def recevoir_ville(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["ville"] = update.message.text.strip()
 
     await update.message.reply_text(
-        "💬 Présente-toi en quelques mots.\n\n"
-        "Exemple :\n"
-        "« J'aime voyager, découvrir de nouveaux endroits "
-        "et faire de belles rencontres. »"
+        "💬 Présente-toi en quelques mots."
     )
 
     return DESCRIPTION
@@ -162,33 +304,30 @@ async def recevoir_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo = update.message.photo[-1]
     user_id = update.effective_user.id
 
-    profiles[user_id] = {
-        "prenom": context.user_data["prenom"],
-        "age": context.user_data["age"],
-        "sexe": context.user_data["sexe"],
-        "ville": context.user_data["ville"],
-        "description": context.user_data["description"],
-        "photo_id": photo.file_id,
-    }
-
-    if user_id not in likes:
-        likes[user_id] = set()
-
-    profil = profiles[user_id]
+    save_profile(
+        user_id,
+        context.user_data["prenom"],
+        context.user_data["age"],
+        context.user_data["sexe"],
+        context.user_data["ville"],
+        context.user_data["description"],
+        photo.file_id,
+    )
 
     await update.message.reply_photo(
-        photo=profil["photo_id"],
+        photo=photo.file_id,
         caption=(
             "❤️ TON PROFIL MIRO DATING\n\n"
-            f"👤 {profil['prenom']}, {profil['age']} ans\n"
-            f"⚧ {profil['sexe']}\n"
-            f"📍 {profil['ville']}\n\n"
-            f"💬 {profil['description']}"
+            f"👤 {context.user_data['prenom']}, "
+            f"{context.user_data['age']} ans\n"
+            f"⚧ {context.user_data['sexe']}\n"
+            f"📍 {context.user_data['ville']}\n\n"
+            f"💬 {context.user_data['description']}"
         ),
     )
 
     await update.message.reply_text(
-        "✅ Ton profil MIRO DATING est créé !\n\n"
+        "✅ Ton profil est enregistré définitivement.\n\n"
         "Utilise /decouvrir pour découvrir d'autres profils. ❤️"
     )
 
@@ -198,123 +337,85 @@ async def recevoir_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# DÉCOUVRIR LES PROFILS
+# DÉCOUVRIR
 # =========================
 
 async def decouvrir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    if user_id not in profiles:
+    if not get_profile(user_id):
         await update.message.reply_text(
-            "⚠️ Tu dois d'abord créer ton profil avec /profil."
+            "⚠️ Crée d'abord ton profil avec /profil."
         )
         return
 
-    await montrer_profil(update, context, user_id)
+    context.user_data.setdefault("vus", set())
 
-
-async def montrer_profil(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    user_id: int
-):
-    # Profils déjà likés ou passés dans cette session
-    vus = context.user_data.setdefault("vus", set())
-
-    candidats = [
-        uid
-        for uid in profiles
-        if uid != user_id and uid not in vus
-    ]
-
-    if not candidats:
-        message = (
-            "🔎 Tu as vu tous les profils disponibles pour le moment.\n\n"
-            "Reviens plus tard pour découvrir de nouvelles personnes. ❤️"
-        )
-
-        if update.callback_query:
-            await update.callback_query.message.reply_text(message)
-        else:
-            await update.message.reply_text(message)
-
-        return
-
-    candidat_id = candidats[0]
-    context.user_data["profil_actuel"] = candidat_id
-
-    profil = profiles[candidat_id]
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "❤️ J'aime",
-                callback_data=f"like_{candidat_id}"
-            ),
-            InlineKeyboardButton(
-                "❌ Passer",
-                callback_data=f"pass_{candidat_id}"
-            ),
-        ]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    caption = (
-        f"👤 {profil['prenom']}, {profil['age']} ans\n"
-        f"⚧ {profil['sexe']}\n"
-        f"📍 {profil['ville']}\n\n"
-        f"💬 {profil['description']}"
+    profil = get_other_profiles(
+        user_id,
+        context.user_data["vus"]
     )
 
-    if update.callback_query:
-        await update.callback_query.message.reply_photo(
-            photo=profil["photo_id"],
-            caption=caption,
-            reply_markup=reply_markup,
+    if not profil:
+        await update.message.reply_text(
+            "🔎 Tu as vu tous les profils disponibles pour le moment. ❤️"
         )
-    else:
-        await update.message.reply_photo(
-            photo=profil["photo_id"],
-            caption=caption,
-            reply_markup=reply_markup,
-        )
+        return
+
+    await envoyer_profil(update, context, profil)
+
+
+async def envoyer_profil(update, context, profil):
+    candidat_id, prenom, age, sexe, ville, description, photo_id = profil
+
+    context.user_data["profil_actuel"] = candidat_id
+
+    keyboard = [[
+        InlineKeyboardButton(
+            "❤️ J'aime",
+            callback_data=f"like_{candidat_id}"
+        ),
+        InlineKeyboardButton(
+            "❌ Passer",
+            callback_data=f"pass_{candidat_id}"
+        ),
+    ]]
+
+    await update.message.reply_photo(
+        photo=photo_id,
+        caption=(
+            f"👤 {prenom}, {age} ans\n"
+            f"⚧ {sexe}\n"
+            f"📍 {ville}\n\n"
+            f"💬 {description}"
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 # =========================
 # LIKE / PASSER
 # =========================
 
-async def traiter_action(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def traiter_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     user_id = update.effective_user.id
-    data = query.data
+    action, candidat = query.data.split("_")
+    candidat_id = int(candidat)
 
-    if data.startswith("like_"):
-        candidat_id = int(data.replace("like_", ""))
+    context.user_data.setdefault("vus", set()).add(candidat_id)
 
-        if user_id not in likes:
-            likes[user_id] = set()
+    if action == "like":
+        add_like(user_id, candidat_id)
 
-        likes[user_id].add(candidat_id)
-
-        context.user_data.setdefault("vus", set()).add(candidat_id)
-
-        # Vérification du match
-        if (
-            candidat_id in likes
-            and user_id in likes.get(candidat_id, set())
-        ):
-            candidat = profiles[candidat_id]
+        if is_match(user_id, candidat_id):
+            profil = get_profile(candidat_id)
 
             await query.message.reply_text(
                 f"💕 MATCH !\n\n"
-                f"Toi et {candidat['prenom']} vous vous êtes aimés ! ❤️"
+                f"Toi et {profil[1]} vous vous êtes aimés ! ❤️"
             )
 
             try:
@@ -322,28 +423,37 @@ async def traiter_action(
                     chat_id=candidat_id,
                     text=(
                         "💕 MATCH !\n\n"
-                        "Quelqu'un que tu as aimé t'a également aimé. ❤️\n\n"
-                        "Vous pouvez maintenant commencer à discuter."
+                        "Vous vous êtes aimés mutuellement ! ❤️"
                     ),
                 )
             except Exception:
                 pass
-
         else:
             await query.message.reply_text(
                 "❤️ J'aime enregistré !"
             )
 
-    elif data.startswith("pass_"):
-        candidat_id = int(data.replace("pass_", ""))
-
-        context.user_data.setdefault("vus", set()).add(candidat_id)
-
+    else:
         await query.message.reply_text(
             "❌ Profil passé."
         )
 
-    await montrer_profil(query, context, user_id)
+    # Afficher le suivant
+    profil_suivant = get_other_profiles(
+        user_id,
+        context.user_data["vus"]
+    )
+
+    if profil_suivant:
+        await envoyer_profil(
+            query,
+            context,
+            profil_suivant
+        )
+    else:
+        await query.message.reply_text(
+            "🔎 Il n'y a plus de profils disponibles pour le moment. ❤️"
+        )
 
 
 # =========================
@@ -354,8 +464,7 @@ async def annuler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
-        "❌ Création du profil annulée.\n\n"
-        "Tu peux recommencer avec /profil."
+        "❌ Création du profil annulée."
     )
 
     return ConversationHandler.END
@@ -366,6 +475,8 @@ async def annuler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================
 
 def main():
+    init_database()
+
     application = Application.builder().token(BOT_TOKEN).build()
 
     conversation = ConversationHandler(
