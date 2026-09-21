@@ -1,10 +1,11 @@
 import os
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
@@ -30,8 +31,12 @@ logging.basicConfig(
 
 PRENOM, AGE, SEXE, VILLE, DESCRIPTION, PHOTO = range(6)
 
-# Stockage temporaire des profils
+# Profils en mémoire
 profiles = {}
+
+# Likes :
+# likes[user_id] = {user_id_1, user_id_2, ...}
+likes = {}
 
 
 # =========================
@@ -42,7 +47,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "❤️ Bienvenue sur MIRO DATING !\n\n"
         "Trouve des personnes, découvre des profils et fais de nouvelles rencontres.\n\n"
-        "Utilise /profil pour créer ton profil."
+        "Commandes disponibles :\n"
+        "👤 /profil — créer ou modifier ton profil\n"
+        "🔎 /decouvrir — découvrir des profils\n"
+        "❌ /annuler — annuler une création de profil"
     )
 
 
@@ -86,7 +94,7 @@ async def recevoir_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if age < 18 or age > 100:
         await update.message.reply_text(
-            "⚠️ Pour utiliser MIRO DATING, l'âge doit être compris entre 18 et 100 ans."
+            "⚠️ L'âge doit être compris entre 18 et 100 ans."
         )
         return AGE
 
@@ -124,7 +132,8 @@ async def recevoir_ville(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💬 Présente-toi en quelques mots.\n\n"
         "Exemple :\n"
-        "« J'aime voyager, découvrir de nouveaux endroits et faire de belles rencontres. »"
+        "« J'aime voyager, découvrir de nouveaux endroits "
+        "et faire de belles rencontres. »"
     )
 
     return DESCRIPTION
@@ -146,12 +155,11 @@ async def recevoir_description(
 async def recevoir_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         await update.message.reply_text(
-            "⚠️ Merci d'envoyer une vraie photo, pas un texte."
+            "⚠️ Merci d'envoyer une photo."
         )
         return PHOTO
 
     photo = update.message.photo[-1]
-
     user_id = update.effective_user.id
 
     profiles[user_id] = {
@@ -162,6 +170,9 @@ async def recevoir_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "description": context.user_data["description"],
         "photo_id": photo.file_id,
     }
+
+    if user_id not in likes:
+        likes[user_id] = set()
 
     profil = profiles[user_id]
 
@@ -178,12 +189,161 @@ async def recevoir_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✅ Ton profil MIRO DATING est créé !\n\n"
-        "La prochaine étape sera de découvrir d'autres profils et de faire des matchs. ❤️"
+        "Utilise /decouvrir pour découvrir d'autres profils. ❤️"
     )
 
     context.user_data.clear()
 
     return ConversationHandler.END
+
+
+# =========================
+# DÉCOUVRIR LES PROFILS
+# =========================
+
+async def decouvrir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in profiles:
+        await update.message.reply_text(
+            "⚠️ Tu dois d'abord créer ton profil avec /profil."
+        )
+        return
+
+    await montrer_profil(update, context, user_id)
+
+
+async def montrer_profil(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_id: int
+):
+    # Profils déjà likés ou passés dans cette session
+    vus = context.user_data.setdefault("vus", set())
+
+    candidats = [
+        uid
+        for uid in profiles
+        if uid != user_id and uid not in vus
+    ]
+
+    if not candidats:
+        message = (
+            "🔎 Tu as vu tous les profils disponibles pour le moment.\n\n"
+            "Reviens plus tard pour découvrir de nouvelles personnes. ❤️"
+        )
+
+        if update.callback_query:
+            await update.callback_query.message.reply_text(message)
+        else:
+            await update.message.reply_text(message)
+
+        return
+
+    candidat_id = candidats[0]
+    context.user_data["profil_actuel"] = candidat_id
+
+    profil = profiles[candidat_id]
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "❤️ J'aime",
+                callback_data=f"like_{candidat_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ Passer",
+                callback_data=f"pass_{candidat_id}"
+            ),
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    caption = (
+        f"👤 {profil['prenom']}, {profil['age']} ans\n"
+        f"⚧ {profil['sexe']}\n"
+        f"📍 {profil['ville']}\n\n"
+        f"💬 {profil['description']}"
+    )
+
+    if update.callback_query:
+        await update.callback_query.message.reply_photo(
+            photo=profil["photo_id"],
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+    else:
+        await update.message.reply_photo(
+            photo=profil["photo_id"],
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+
+
+# =========================
+# LIKE / PASSER
+# =========================
+
+async def traiter_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    data = query.data
+
+    if data.startswith("like_"):
+        candidat_id = int(data.replace("like_", ""))
+
+        if user_id not in likes:
+            likes[user_id] = set()
+
+        likes[user_id].add(candidat_id)
+
+        context.user_data.setdefault("vus", set()).add(candidat_id)
+
+        # Vérification du match
+        if (
+            candidat_id in likes
+            and user_id in likes.get(candidat_id, set())
+        ):
+            candidat = profiles[candidat_id]
+
+            await query.message.reply_text(
+                f"💕 MATCH !\n\n"
+                f"Toi et {candidat['prenom']} vous vous êtes aimés ! ❤️"
+            )
+
+            try:
+                await context.bot.send_message(
+                    chat_id=candidat_id,
+                    text=(
+                        "💕 MATCH !\n\n"
+                        "Quelqu'un que tu as aimé t'a également aimé. ❤️\n\n"
+                        "Vous pouvez maintenant commencer à discuter."
+                    ),
+                )
+            except Exception:
+                pass
+
+        else:
+            await query.message.reply_text(
+                "❤️ J'aime enregistré !"
+            )
+
+    elif data.startswith("pass_"):
+        candidat_id = int(data.replace("pass_", ""))
+
+        context.user_data.setdefault("vus", set()).add(candidat_id)
+
+        await query.message.reply_text(
+            "❌ Profil passé."
+        )
+
+    await montrer_profil(query, context, user_id)
 
 
 # =========================
@@ -214,16 +374,28 @@ def main():
         ],
         states={
             PRENOM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recevoir_prenom)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    recevoir_prenom
+                )
             ],
             AGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recevoir_age)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    recevoir_age
+                )
             ],
             SEXE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recevoir_sexe)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    recevoir_sexe
+                )
             ],
             VILLE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, recevoir_ville)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    recevoir_ville
+                )
             ],
             DESCRIPTION: [
                 MessageHandler(
@@ -232,7 +404,10 @@ def main():
                 )
             ],
             PHOTO: [
-                MessageHandler(filters.PHOTO, recevoir_photo)
+                MessageHandler(
+                    filters.PHOTO,
+                    recevoir_photo
+                )
             ],
         },
         fallbacks=[
@@ -240,8 +415,22 @@ def main():
         ],
     )
 
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
     application.add_handler(conversation)
+
+    application.add_handler(
+        CommandHandler("decouvrir", decouvrir)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            traiter_action,
+            pattern=r"^(like_|pass_)"
+        )
+    )
 
     print("❤️ MIRO DATING est en ligne !")
 
